@@ -297,7 +297,21 @@ def build_turn_context(
             agent._turns_since_memory = 0
 
     # Add user message.
-    user_msg = {"role": "user", "content": user_message}
+    # Guard against an empty/whitespace-only user_message. The gateway
+    # emits startup-resume internal events with text="" (gateway/run.py
+    # _schedule_resume_pending_sessions) and a platform adapter can also
+    # surface a blank text body. Sending such a message as the trailing
+    # prompt makes providers reject the request — Z.ai GLM returns HTTP
+    # 400 code 1213 ("prompt parameter not received normally"), which is
+    # non-retryable and crashes the turn into a restart loop. Substitute
+    # a minimal continuation sentinel so the role sequence stays valid
+    # while never transmitting an empty prompt.
+    _user_content = (
+        user_message
+        if isinstance(user_message, str) and user_message.strip()
+        else "(continue)"
+    )
+    user_msg = {"role": "user", "content": _user_content}
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

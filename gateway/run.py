@@ -399,7 +399,11 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):
-        return _gateway_provider_error_reply(text)
+        # Suppress — the final response path (_sanitize_gateway_final_response)
+        # will deliver the user-safe mapped reply.  Returning the mapped reply
+        # here too causes a duplicate message in Telegram (one from the status
+        # callback, one from the final response).
+        return None
     return text
 
 
@@ -5673,11 +5677,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
+            # Internal resume event. The text body is the seed user
+            # message for the resumed turn — it must be non-empty, because
+            # a blank trailing prompt is rejected by providers (Z.ai GLM
+            # returns HTTP 400 code 1213 "prompt parameter not received
+            # normally"), which is non-retryable and crashed the gateway
+            # into a restart loop. When the freshness conditions hold, the
+            # _is_resume_pending / _has_fresh_tool_tail branches in
+            # _handle_message_with_agent still prepend their own
+            # reason-aware system note on top; when they don't, this seed
+            # carries the turn so the prompt is never empty.
             event = MessageEvent(
-                text="",
+                text=(
+                    "[System note: The gateway restarted and the previous "
+                    "turn was interrupted. Review the conversation history "
+                    "above, then continue the interrupted task or briefly "
+                    "summarize the current state for the user.]"
+                ),
                 message_type=MessageType.TEXT,
                 source=source,
                 internal=True,
