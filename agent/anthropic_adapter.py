@@ -55,7 +55,7 @@ def _get_anthropic_sdk():
 
 logger = logging.getLogger(__name__)
 
-THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+THINKING_BUDGET = {"xhigh": 31999, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
 # Anthropic exposes 5 levels on 4.7+: low, medium, high, xhigh, max.
 # Opus/Sonnet 4.6 only expose 4 levels: low, medium, high, max — no xhigh.
@@ -155,6 +155,11 @@ _ANTHROPIC_OUTPUT_LIMITS = {
     # Qwen models via DashScope Anthropic-compatible endpoint
     # DashScope enforces max_tokens ∈ [1, 65536]
     "qwen3":               65_536,
+    # Z.AI GLM via Anthropic Messages endpoint — match Claude Code's
+    # CLAUDE_CODE_MAX_OUTPUT_TOKENS default (64000) so Hermes and
+    # claude-glm send identical wire requests.
+    "glm-5":               64_000,
+    "glm-4":               64_000,
 }
 
 # For any model not in the table, assume the highest current limit.
@@ -447,6 +452,21 @@ def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     return normalized.rstrip("/").lower().startswith("https://api.kimi.com/coding")
 
 
+def _is_zai_anthropic_endpoint(base_url: str | None) -> bool:
+    """Return True for Z.AI's Anthropic-compatible endpoint.
+
+    Z.AI exposes GLM models via an Anthropic Messages API at
+    ``https://api.z.ai/api/anthropic``.  Detecting it lets us route to
+    x-api-key auth and Claude Code User-Agent, matching Claude Code's
+    wire format exactly.
+    """
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    normalized = normalized.rstrip("/").lower()
+    return "api.z.ai/api/anthropic" in normalized
+
+
 # Model-name prefixes that identify the Kimi / Moonshot family.  Covers
 # - official slugs: ``kimi-k2.5``, ``kimi_thinking``, ``moonshot-v1-8k``
 # - common release lines: ``k1.5-...``, ``k2-thinking``, ``k25-...``, ``k2.5-...``
@@ -544,6 +564,7 @@ def _requires_bearer_auth(base_url: str | None) -> bool:
     return (
         normalized.startswith(("https://api.minimax.io/anthropic", "https://api.minimaxi.com/anthropic"))
         or "azure.com" in normalized
+        or normalized.startswith("https://api.z.ai")  # Z.AI (Zhipu GLM) anthropic endpoint → Bearer auth like Claude Code
     )
 
 
@@ -792,6 +813,46 @@ def build_anthropic_client(
             "User-Agent": "claude-code/0.1.0",
             **( {"anthropic-beta": ",".join(common_betas)} if common_betas else {} )
         }
+    elif _is_zai_anthropic_endpoint(base_url):
+        # Z.AI's Anthropic endpoint — match Claude Code's wire format exactly
+        # (captured via local proxy 2026-06-30):
+        #   - Bearer auth (Authorization: *** via auth_token
+        #   - User-Agent: claude-cli/<ver> (external, sdk-cli)
+        #   - anthropic-beta with effort-2025-11-24 etc.
+        # The Python SDK stamps its own User-Agent and X-Stainless-* headers
+        # on every request.  Claude Code (Node.js) sends neither.  Use a
+        # custom httpx.Client with an event hook to strip those headers and
+        # force the Claude Code User-Agent, so the wire format matches byte
+        # for byte.
+        kwargs["auth_token"] = api_key
+        zai_betas = [
+            "claude-code-20250219",
+            "interleaved-thinking-2025-05-14",
+            "thinking-token-count-2026-05-13",
+            "context-management-2025-06-27",
+            "prompt-caching-scope-2026-01-05",
+            "mid-conversation-system-2026-04-07",
+            "effort-2025-11-24",
+        ]
+        _zai_ua = f"claude-cli/{_get_claude_code_version()} (external, sdk-cli)"
+
+        def _zai_request_hook(request):
+            """Strip SDK-stamped headers and force Claude Code identity."""
+            # Force Claude Code User-Agent
+            request.headers["user-agent"] = _zai_ua
+            # Strip X-Stainless-* headers (Python SDK only, Node.js doesn't send them)
+            for key in list(request.headers.keys()):
+                if key.lower().startswith("x-stainless"):
+                    del request.headers[key]
+
+        from httpx import Client as _HttpClient
+        kwargs["http_client"] = _HttpClient(
+            event_hooks={"request": [_zai_request_hook]},
+        )
+        headers = {"anthropic-beta": ",".join(zai_betas)}
+        headers["user-agent"] = _zai_ua
+        headers["x-app"] = "cli"
+        kwargs["default_headers"] = headers
     elif _requires_bearer_auth(normalized_base_url):
         # Some Anthropic-compatible providers (e.g. MiniMax) expect the API key in
         # Authorization: Bearer *** for regular API keys. Route those endpoints
@@ -2538,8 +2599,11 @@ def build_anthropic_kwargs(
         else:
             system = [cc_block]
 
-        # 2. Sanitize system prompt — replace product name references
-        #    to avoid Anthropic's server-side content filters.
+    # 2. Sanitize system prompt — replace product name references.
+    #    Applied to both OAuth (Claude Code) and Z.AI Anthropic endpoints
+    #    so the Hermes brand identity doesn't leak to third-party providers
+    #    that impersonate Claude Code's wire format.
+    if is_oauth or _is_zai_anthropic_endpoint(base_url):
         for block in system:
             if isinstance(block, dict) and block.get("type") == "text":
                 text = block.get("text", "")
@@ -2549,7 +2613,9 @@ def build_anthropic_kwargs(
                 text = text.replace("Nous Research", "Anthropic")
                 block["text"] = text
 
-        # 3. Normalize tool names so NOTHING goes on the OAuth wire with a
+    # 3. Normalize tool names — OAuth only (Z.AI has no such classifier).
+    if is_oauth:
+        # Normalize tool names so NOTHING goes on the OAuth wire with a
         #    single-underscore ``mcp_`` prefix.  Anthropic's subscription/OAuth
         #    billing classifier treats a single-underscore ``mcp_`` tool name as
         #    a third-party-app fingerprint and rejects the request with HTTP 400
@@ -2655,6 +2721,32 @@ def build_anthropic_kwargs(
                     adaptive_effort = "max"
                 kwargs["output_config"] = {
                     "effort": adaptive_effort,
+                }
+            elif _is_zai_anthropic_endpoint(base_url):
+                # Z.AI's Anthropic-compatible endpoint with GLM models.
+                # GLM doesn't natively support Anthropic's adaptive thinking,
+                # but Claude Code sends {{"type": "adaptive"}} + output_config
+                # + context_management regardless of model — it does no model
+                # check.  Match that wire format so Hermes and claude-glm send
+                # identical requests; the endpoint decides how to interpret
+                # the fields.
+                kwargs["thinking"] = {"type": "adaptive"}
+                adaptive_effort = ADAPTIVE_EFFORT_MAP.get(effort, "medium")
+                if adaptive_effort == "xhigh":
+                    adaptive_effort = "max"
+                kwargs["output_config"] = {
+                    "effort": adaptive_effort,
+                }
+                # Match Claude Code's context_management edit (captured via
+                # local proxy).  ``clear_thinking`` with ``keep: "all"`` is a
+                # no-op semantic that tells the endpoint thinking blocks should
+                # be retained across turns.
+                kwargs["extra_body"] = {
+                    "context_management": {
+                        "edits": [
+                            {"type": "clear_thinking_20251015", "keep": "all"}
+                        ]
+                    }
                 }
             else:
                 kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}

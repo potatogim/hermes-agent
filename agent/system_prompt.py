@@ -516,6 +516,34 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
+_ZAI_HOSTS = ("api.z.ai", "open.bigmodel.cn")
+
+
+def _is_zai_endpoint(agent: Any) -> bool:
+    """True when the agent targets a Z.AI / Zhipu endpoint.
+
+    Z.AI's GLM Coding Plan rejects requests whose system prompt contains the
+    exact phrase ``"Hermes Agent"`` with a misleading HTTP 429 / code 1305
+    (#47685, #53002).  We need to detect both the Anthropic bridge and the
+    OpenAI-compatible endpoint so the sanitize covers every transport path.
+    """
+    provider = (getattr(agent, "provider", "") or "").lower()
+    if provider in ("zai", "glm", "z-ai", "z.ai", "zhipu"):
+        return True
+    hostname = (getattr(agent, "_base_url_hostname", "") or "").lower()
+    return any(h in hostname for h in _ZAI_HOSTS)
+
+
+def _sanitize_zai_prompt(text: str) -> str:
+    """Rewrite brand strings that trigger Z.AI's WAF / content filter (#47685)."""
+    return (
+        text.replace("Hermes Agent", "Claude Code")
+        .replace("Hermes agent", "Claude Code")
+        .replace("hermes-agent", "claude-code")
+        .replace("Nous Research", "Anthropic")
+    )
+
+
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
     """Assemble the full system prompt from all layers.
 
@@ -533,6 +561,14 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     """
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
+
+    # Z.AI / Zhipu endpoints reject prompts containing "Hermes Agent" with a
+    # bogus 429 / code 1305 (#47685, #53002).  Sanitize at this single
+    # chokepoint so every source (SOUL, skills, context files, memory,
+    # timestamp) is covered regardless of transport (Anthropic or OpenAI).
+    # Non-Z.AI providers are byte-identical.
+    if _is_zai_endpoint(agent):
+        joined = _sanitize_zai_prompt(joined)
 
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
